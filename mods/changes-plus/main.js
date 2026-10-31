@@ -30,7 +30,7 @@ import { ask } from "./ask.js";
 import { palette } from "./palette.js";
 import { Dialog } from "./dialog.js";
 import { Overlay } from "./menu.js";
-import { isNew, stageAll, push, pushInfo, CHANGED } from "./git.js";
+import { isNew, stageAll, unstageAll, stageFile, unstageFile, stash, stashApply, stashList, push, pushInfo, CHANGED } from "./git.js";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -39,10 +39,24 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
 }
 const key = () => JSON.stringify(location());
+async function numstat(git, args) {
+  const r = await git(["diff", ...args, "--numstat", "-z", "--no-renames"]), out = {};
+  if (r.code !== 0) return out;
+  for (const entry of r.stdout.split("\0")) {
+    const [a, d, ...parts] = entry.split("\t");
+    if (parts.length) out[parts.join("\t")] = { add: Number(a) || 0, del: Number(d) || 0 };
+  }
+  return out;
+}
 const stagedState = (xy) => !xy || xy === "??" || xy[0] === " " || xy.includes("U") || xy === "AA" || xy === "DD" ? null : xy[1] === " " ? "staged" : "part staged";
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 const NONE = "#00000000", SENT = "reviewer.sent", DRAFTS = "reviewer.drafts", SCOPE = "reviewer.scope";
-const ACTIONS = { commit: { name: "Commit", busy: "Committing…" }, stage: { name: "Stage all", busy: "Staging…" }, push: { name: "Push", busy: "Pushing…" } };
+const ACTIONS = {
+  commit: { name: "Commit", busy: "Committing…" }, push: { name: "Push", busy: "Pushing…" },
+  stage: { name: "Stage all", busy: "Staging…" }, unstage: { name: "Unstage all", busy: "Unstaging…" },
+  stageFile: { name: "Stage", busy: "Staging…" }, unstageFile: { name: "Unstage", busy: "Unstaging…" },
+  stash: { name: "Stash", busy: "Stashing…" }, apply: { name: "Stash apply", busy: "Applying…" }, pop: { name: "Stash pop", busy: "Popping…" },
+};
 // The review scopes, in picker order. `ref` is what the working tree is diffed against.
 const SCOPES = ["work", "last", "branch"];
 // The code font: the terminal's (`font` in settings, JetBrains Mono when
@@ -81,7 +95,7 @@ export default class Changes extends View {
     // Opened as the send dialog (ask.js): this copy is the dialog, nothing else.
     if (props()?.dialog) { this.dialog = Object.create(Dialog.prototype); this.dialog.init(_props, cx); return; }
     if (props()?.menu || props()?.revertFile || props()?.revertAll) { this.dialog = Object.create(Overlay.prototype); this.dialog.init(_props, cx); return; }
-    this.dirty = new Map(); this.pushable = null; this.seenChange = shared(CHANGED);
+    this.dirty = new Map(); this.pushable = null; this.stashes = []; this.sectionStats = { staged: {}, unstaged: {} }; this.choosingStash = false; this.seenChange = shared(CHANGED);
     this.files = []; this.rows = []; this.index = new Map(); this.items = []; this.sizes = []; this.diffWidth = 0; this.gutter = 30; this.message = "";
     this.comments = []; this.composer = null; this.handle = cx.focus_handle(); this.scroll = VirtualListScrollHandle.new();
     this.fontSize = codeSize(); this.row = rowOf(this.fontSize);
@@ -134,7 +148,7 @@ export default class Changes extends View {
     if (context !== this.context) {
       this.context = context; this.root = null; this.files = []; this.open = null; this.comments = []; this.composer = null;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note_ = null; this.watched = null; this.closed = false; this.limited = false;
-      this.dirty = new Map(); this.pushable = null;
+      this.dirty = new Map(); this.pushable = null; this.stashes = [];
     }
     if (!cwd) return;
     this.loading = true;
@@ -187,9 +201,10 @@ export default class Changes extends View {
           const stat = stats[path] ?? { add: 0, del: 0 };
           files.push({ path, status: s, fresh, ...stat });
         }
-        const pushable = hasHead ? await pushInfo({ root, on }) : null;
+        const pushable = hasHead ? await pushInfo({ root, on }) : null, stashes = hasHead ? await stashList({ root, on }) : [];
+        const sectionStats = { staged: await numstat(git, ["--cached"]), unstaged: await numstat(git, []) };
         if (key() !== context) return;
-        this.dirty = dirty; this.pushable = pushable;
+        this.dirty = dirty; this.pushable = pushable; this.stashes = stashes; this.sectionStats = sectionStats;
         if (root !== this.root || scope !== this.scope || ref !== this.ref) { this.setLines([]); }
         const changedSet = root !== this.root || scope !== this.scope;
         this.root = root; this.on = on; this.hasHead = hasHead; this.scope = scope; this.scopeInfo = info; this.ref = ref;
@@ -487,7 +502,25 @@ export default class Changes extends View {
     }, cx);
   }
 
-  stage(cx) { this.perform("stage", (repo) => stageAll(repo), cx); }
+  stage(cx) {
+    if (this.allStaged()) this.perform("unstage", (repo) => unstageAll({ ...repo, hasHead: this.hasHead }), cx);
+    else this.perform("stage", (repo) => stageAll(repo), cx);
+  }
+
+  allStaged() { return this.dirty.size > 0 && [...this.dirty.values()].every((xy) => stagedState(xy) === "staged"); }
+
+  toggleFile(path, unstage, cx) {
+    const hasHead = this.hasHead;
+    this.busyPath = path;
+    this.perform(unstage ? "unstageFile" : "stageFile", (repo) => (unstage ? unstageFile : stageFile)({ ...repo, path, hasHead }), cx);
+  }
+
+  stash(cx) { this.perform("stash", (repo) => stash(repo), cx); }
+
+  applyStash(ref, pop, cx) {
+    this.choosingStash = false;
+    this.perform(pop ? "pop" : "apply", (repo) => stashApply({ ...repo, ref, pop }), cx);
+  }
 
   push(cx) {
     const target = this.pushable;
@@ -502,7 +535,7 @@ export default class Changes extends View {
     cx.spawn(async (cx) => {
       try { await work(repo, context); }
       catch (e) { if (key() === context) this.note_ = `${ACTIONS[kind].name} failed: ${e.message ?? e}`; }
-      finally { this.busy = false; this.refresh(cx, true); cx.notify(); }
+      finally { this.busy = false; this.busyPath = null; this.refresh(cx, true); cx.notify(); }
     });
     cx.notify();
   }
@@ -630,24 +663,8 @@ export default class Changes extends View {
         .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${del}`))
         .when(n > 0, (e) => e.child(link("review-discard", "Discard", (_e, cx) => this.setComments([], cx))).child(button("review-submit", `Submit review · ${n}`, true, (_e, cx) => this.submit(cx))))
         .when(n === 0 && canAsk, (e) => e.child(button("ask", "Ask about diff", false, (_e, cx) => this.askAbout(null, cx)))))
-      .when(Boolean(this.root) && this.dirty.size > 0, (e) => e.child(this.uncommittedBar(t)))
-      .child(v_flex().id("changes-list").flex_none().h(Math.min(200, Math.max(44, this.files.length * 28 + 12))).overflow_y_scrollbar().p(6).border_b(1).border_color(t.border).children(this.files.map((f) => {
-        const parts = f.path.split("/"), name = parts.pop(), k = perFile[f.path], staged = stagedState(this.dirty.get(f.path));
-        return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
-          .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.fileMenu(f.path); })
-          .child(div().w(14).text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
-          .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
-          .when(Boolean(staged), (e) => e.child(div().px(5).h(16).flex().items_center().rounded(4).bg(t.ansi2 + "26").text_size(10).text_color(t.ansi2).tooltip(staged === "staged" ? "Staged" : "Partly staged").child(staged)))
-          // One speech bubble: the draft count when there are drafts, and a click comments on the whole file.
-          .child(h_flex().id(`comment-file-${f.path}`).h(18).min_w(18).px(k ? 5 : 0).gap(3).items_center().justify_center().rounded(4).cursor_pointer()
-            .when(Boolean(k), (e) => e.bg(t.accent + "33").text_size(10).text_color(t.foreground))
-            .when(!k, (e) => e.text_color(t.muted))
-            .hover((s) => s.bg(k ? t.accent + "55" : t.hover).text_color(t.foreground))
-            .tooltip(k ? `${k} draft comment${k > 1 ? "s" : ""} · click to comment on the whole file` : "Comment on the whole file")
-            .on_click((_e, cx) => { cx.stop_propagation(); this.commentFile(f.path, cx); })
-            .when(Boolean(k), (e) => e.child(String(k))).child(svg("mods/changes-plus/comment.svg").size(k ? 10 : 12)))
-          .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`))).when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
-      })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : this.root ? "No uncommitted changes" : "No folder")))))
+      .when(Boolean(this.root) && (this.dirty.size > 0 || this.stashes.length > 0), (e) => e.child(this.uncommittedBar(t)))
+      .child(this.fileList(t, perFile))
       .when(this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
       .child(h_flex().flex_1().min_h(0).items_stretch()
         .child(div().flex_1().min_w(0).min_h(0).relative().font_family(codeFont()).text_size(this.fontSize)
@@ -681,16 +698,91 @@ export default class Changes extends View {
       .when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover))).tooltip(tip).on_click((_e, cx) => this.push(cx)).child(label);
   }
 
+  // Staged first, then unstaged; a partly staged file is in both. In the last-commit and
+  // branch scopes, files with no uncommitted change are listed last as committed.
+  sections() {
+    const staged = [], unstaged = [], committed = [], stats = this.sectionStats;
+    for (const f of this.files) {
+      const xy = this.dirty.get(f.path);
+      if (!xy) { committed.push({ f, letter: f.status, add: f.add, del: f.del }); continue; }
+      const conflict = xy.includes("U") || xy === "AA" || xy === "DD", fresh = xy === "??";
+      if (!conflict && !fresh && xy[0] !== " ") staged.push({ f, letter: xy[0], ...(stats.staged[f.path] ?? { add: 0, del: 0 }) });
+      if (conflict || fresh || xy[1] !== " ") unstaged.push({ f, letter: conflict ? "U" : fresh ? "A" : xy[1], ...(stats.unstaged[f.path] ?? (fresh ? { add: f.add, del: f.del } : { add: 0, del: 0 })) });
+    }
+    return [{ key: "staged", label: "Staged", rows: staged }, { key: "unstaged", label: "Unstaged", rows: unstaged }, { key: "committed", label: "Committed", rows: committed }].filter((s) => s.rows.length);
+  }
+
+  fileList(t, perFile) {
+    const groups = this.sections(), rows = groups.reduce((n, g) => n + g.rows.length, 0);
+    const empty = div().p(8).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : this.root ? "No uncommitted changes" : "No folder"));
+    return v_flex().id("changes-list").flex_none().h(Math.min(260, Math.max(44, rows * 28 + groups.length * 30 + 12))).overflow_y_scrollbar().p(6).border_b(1).border_color(t.border)
+      .children(groups.flatMap((g, i) => [this.sectionHeader(t, g, i > 0), ...g.rows.map((r) => this.fileRow(t, g.key, r, perFile[r.f.path]))]))
+      .when(!rows, (e) => e.child(empty));
+  }
+
+  sectionHeader(t, group, divided) {
+    return h_flex().id(`section-${group.key}`).h(30).flex_none().px(8).gap(6).items_center().text_size(11).font_semibold().text_color(t.muted)
+      .when(divided, (e) => e.mt(2).border_t(1).border_color(t.border))
+      .child(group.label).child(div().font_normal().text_color(t.dim).child(String(group.rows.length)));
+  }
+
+  fileRow(t, section, { f, letter, add, del }, k) {
+    const parts = f.path.split("/"), name = parts.pop(), id = `${section}-${f.path}`;
+    return h_flex().id(`change-${id}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
+      .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.fileMenu(f.path); })
+      .child(div().w(14).text_size(11).text_color(letter === "A" ? t.ansi2 : letter === "D" || letter === "U" ? t.ansi1 : t.blocked).child(letter))
+      .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
+      .when(section !== "committed", (e) => e.child(this.fileStageButton(t, f.path, id, section === "staged")))
+      .child(h_flex().id(`comment-file-${id}`).h(18).min_w(18).px(k ? 5 : 0).gap(3).items_center().justify_center().rounded(4).cursor_pointer()
+        .when(Boolean(k), (e) => e.bg(t.accent + "33").text_size(10).text_color(t.foreground))
+        .when(!k, (e) => e.text_color(t.muted))
+        .hover((s) => s.bg(k ? t.accent + "55" : t.hover).text_color(t.foreground))
+        .tooltip(k ? `${k} draft comment${k > 1 ? "s" : ""} · click to comment on the whole file` : "Comment on the whole file")
+        .on_click((_e, cx) => { cx.stop_propagation(); this.commentFile(f.path, cx); })
+        .when(Boolean(k), (e) => e.child(String(k))).child(svg("mods/changes-plus/comment.svg").size(k ? 10 : 12)))
+      .when(add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${add}`))).when(del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)));
+  }
+
+  fileStageButton(t, path, id, unstage) {
+    const busy = this.busyPath === path, enabled = !this.busy;
+    return div().id(`stage-${id}`).h(18).px(6).flex().items_center().rounded(4).border_1().border_color(t.border).text_size(10).text_color(enabled ? t.muted : t.dim)
+      .when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)))
+      .tooltip(unstage ? "Unstage this file" : "Stage this file")
+      .on_click((_e, cx) => { cx.stop_propagation(); this.toggleFile(path, unstage, cx); })
+      .child(busy ? "…" : unstage ? "Unstage" : "Stage");
+  }
+
+
   uncommittedBar(t) {
     const codes = [...this.dirty.values()], staged = codes.filter((xy) => stagedState(xy)).length;
-    const allStaged = codes.every((xy) => stagedState(xy) === "staged"), idle = !this.busy;
+    const dirty = codes.length > 0, allStaged = this.allStaged(), idle = !this.busy;
     const action = (id, label, color, enabled, onClick, tip) => div().id(id).h(22).px(7).flex().items_center().rounded(6).text_size(11.5).text_color(enabled ? color : t.dim)
       .when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(onClick)).when(!enabled, (e) => e.opacity(0.6)).tooltip(tip).child(label);
-    return h_flex().h(32).flex_none().px(14).gap(6).items_center().border_b(1).border_color(t.border)
-      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(`Uncommitted · ${codes.length} file${codes.length > 1 ? "s" : ""}${staged ? ` · ${staged} staged` : ""}`))
-      .child(action("stage-all", this.busy === "stage" ? ACTIONS.stage.busy : "Stage all", t.foreground, idle && !allStaged, (_e, cx) => this.stage(cx), allStaged ? "Everything is staged" : "git add -A"))
-      .child(action("revert-all", "Revert all…", t.ansi1, idle && this.hasHead, () => this.revertAll(), this.hasHead ? "Discard every uncommitted change and delete new files" : "Nothing committed to revert to"));
+    const summary = dirty ? `Uncommitted · ${codes.length} file${codes.length > 1 ? "s" : ""}${staged ? ` · ${staged} staged` : ""}` : "No uncommitted changes";
+    const stageLabel = this.busy === "stage" ? ACTIONS.stage.busy : this.busy === "unstage" ? ACTIONS.unstage.busy : allStaged ? "Unstage all" : "Stage all";
+    return h_flex().h(32).flex_none().px(14).gap(4).items_center().border_b(1).border_color(t.border)
+      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(summary))
+      .when(dirty, (e) => e.child(action("stage-all", stageLabel, t.foreground, idle, (_e, cx) => this.stage(cx), allStaged ? "git reset: unstage everything, keeping the changes" : "git add -A")))
+      .when(dirty, (e) => e.child(action("stash", this.busy === "stash" ? ACTIONS.stash.busy : "Stash", t.foreground, idle && this.hasHead, (_e, cx) => this.stash(cx), this.hasHead ? "git stash -u: put every change, new files too, on the stash" : "Nothing committed to stash against")))
+      .when(this.stashes.length > 0, (e) => e.child(this.stashPicker(t, idle)))
+      .when(dirty, (e) => e.child(action("revert-all", "Revert all…", t.ansi1, idle && this.hasHead, () => this.revertAll(), this.hasHead ? "Discard every uncommitted change and delete new files" : "Nothing committed to revert to")));
   }
+
+  stashPicker(t, idle) {
+    const label = this.busy === "apply" ? ACTIONS.apply.busy : this.busy === "pop" ? ACTIONS.pop.busy : `Stashes · ${this.stashes.length}`;
+    const box = h_flex().id("stash-box").h(22).px(7).gap(4).items_center().rounded(6).text_size(11.5).cursor_pointer().hover((s) => s.bg(t.hover))
+      .when(this.choosingStash, (e) => e.bg(t.hover)).tooltip("Apply a stash").child(label).child(svg("mods/changes-plus/chevron-down.svg").size(10).text_color(t.dim));
+    const link = (id, text, onClick) => div().id(id).h(22).px(7).flex().items_center().rounded(5).text_size(11).text_color(idle ? t.foreground : t.dim).border_1().border_color(t.border)
+      .when(idle, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(onClick)).child(text);
+    return Popover.new("stashes").anchor("top_right").open(this.choosingStash).on_open_change((open, cx) => { this.choosingStash = open; cx.notify(); })
+      .trigger(box)
+      .content(v_flex().mt(4).w(340).max_h(320).overflow_y_scrollbar().p(6).gap(2).rounded(8).border_1().border_color(t.border).bg(t.popover).shadow_md().children(this.stashes.map((s, i) =>
+        h_flex().id(`stash-${i}`).px(8).py(6).gap(8).items_center().rounded(6).hover((st) => st.bg(t.hover))
+          .child(v_flex().flex_1().min_w(0).gap(1).child(div().text_size(12).truncate().child(s.subject)).child(div().text_size(10.5).text_color(t.dim).child(`${s.ref} · ${s.age}`)))
+          .child(link(`apply-${i}`, "Apply", (_e, cx) => this.applyStash(s.ref, false, cx)))
+          .child(link(`pop-${i}`, "Pop", (_e, cx) => this.applyStash(s.ref, true, cx))))));
+  }
+
 
   pick(path, cx) {
     this.open = this.open === path ? null : path; this.setLines([]); this.note_ = null;

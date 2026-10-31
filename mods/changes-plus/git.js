@@ -4,8 +4,8 @@ import { exec } from "herdr";
 
 export const CHANGED = "changes-plus.changed";
 
-async function git(root, on, args) {
-  const r = await exec("git", ["--literal-pathspecs", ...args], { cwd: root, on });
+async function git(root, on, args, { literal = true } = {}) {
+  const r = await exec("git", literal ? ["--literal-pathspecs", ...args] : args, { cwd: root, on });
   if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `git ${args[0]} failed`);
   return r.stdout;
 }
@@ -25,6 +25,26 @@ export async function revertAll({ root, on }) {
 }
 
 export const stageAll = ({ root, on }) => git(root, on, ["add", "-A"]);
+
+export const unstageAll = ({ root, on, hasHead }) =>
+  git(root, on, hasHead ? ["reset", "-q"] : ["rm", "-r", "-q", "--cached", "--", "."]);
+
+export const stageFile = ({ root, on, path }) => git(root, on, ["add", "-A", "--", path]);
+
+export const unstageFile = ({ root, on, path, hasHead }) =>
+  git(root, on, hasHead ? ["restore", "--staged", "--", path] : ["rm", "-q", "--cached", "--", path]);
+
+// git stash uses pathspec magic internally; under --literal-pathspecs it leaves new files behind.
+export const stash = ({ root, on }) => git(root, on, ["stash", "push", "--include-untracked"], { literal: false });
+
+export const stashApply = ({ root, on, ref, pop }) => git(root, on, ["stash", pop ? "pop" : "apply", ref], { literal: false });
+
+/** The repo's stashes, newest first: `{ ref: "stash@{0}", subject, age }`. */
+export async function stashList({ root, on }) {
+  const r = await exec("git", ["stash", "list", "--format=%gd%x1f%gs%x1f%cr"], { cwd: root, on });
+  if (r.code !== 0) return [];
+  return r.stdout.split("\n").filter(Boolean).map((line) => { const [ref, subject, age] = line.split("\x1f"); return { ref, subject, age }; });
+}
 
 export const push = ({ root, on, upstream, remote }) =>
   git(root, on, upstream ? ["push"] : ["push", "-u", remote, "HEAD"]);
