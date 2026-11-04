@@ -100,7 +100,14 @@ The choice is remembered per repo in the shared key `reviewer.scope`. A repo ope
 - **Unstaged:** the work-tree column is set, or the file is untracked (`A`), or it is a conflict (`U`). Its counts come from `git diff --numstat`.
 - A file that is staged and then edited again is in both sections.
 
-The first file opens by itself. Clicking a row opens its diff; clicking the open file closes it.
+The first row opens by itself. Clicking a row opens its diff; clicking the open row closes it. Only the clicked row is selected, so a file in both sections is selected in one of them.
+
+**Diff per section.** In the Uncommitted scope the diff matches the row's section:
+- **Staged:** `git diff --cached -- <path>`, HEAD to the index. This is what a commit would take.
+- **Unstaged:** `git diff -- <path>`, the index to the working tree. For a partly staged file this leaves out the staged part.
+- Untracked files show their whole content, and conflicts diff against HEAD.
+
+In the Last commit and vs base scopes every row diffs against the scope's ref. When a refresh moves the open file out of its section (you staged the rest of it), the diff follows it to the section it is in now.
 
 **Stage and unstage.**
 - **Stage** on an Unstaged row runs `git add -A -- <path>`, which also stages deletions.
@@ -119,7 +126,9 @@ The first file opens by itself. Clicking a row opens its diff; clicking the open
 - **Stashes · N** opens a 340 px dropdown of `git stash list`, newest first. Each row shows the message, then `stash@{n} · <age>`, then Apply (`git stash apply <ref>`) and Pop (`git stash pop <ref>`).
 
 **Commit and push.**
-- **Commit** is enabled once the message has text. It runs `git add -A` and `git commit -m <message>`, then clears the input. Enter in the input commits too.
+- **Commit** is enabled once the message has text. It runs `git commit -m <message>`, which commits only the staged changes, then clears the input. Enter in the input commits too.
+- With nothing staged, the first Commit does not run git. The button turns into "Stage all & commit" and a `blocked` note reads "Nothing is staged. Commit again to stage every change and commit it." Pressing it again runs `git add -A` and then `git commit`. Editing the message, or staging something, cancels the question.
+- With no changes at all, Commit shows "Nothing to commit".
 - **Push** runs `git push` when the branch has an upstream and is ahead of it. With no upstream it runs `git push -u <remote> HEAD`, using `origin` or the first remote. It is disabled when up to date, on a detached HEAD, or with no remote, and its tooltip says why.
 
 **Review.**
@@ -174,11 +183,13 @@ The first file opens by itself. Clicking a row opens its diff; clicking the open
 - In a repo with one file staged and then edited again, one unstaged edit and one untracked file, the list shows:
   - Staged with 1 file, then a border, then Unstaged with 3 files
   - the twice-edited file in both sections, with different +/− counts
+  - its Staged row diffs only the first edit, and its Unstaged row only the second
 - The Stage button on an Unstaged row moves the file to Staged. Unstage moves it back. A deleted file stages too.
 - Stage all moves everything to Staged and the button reads "Unstage all". Unstage all empties Staged.
 - Right-click a modified file, choose Revert changes…, and confirm: it leaves the list and matches HEAD. On an untracked file, Delete file… removes it from disk.
 - Revert all… leaves `git status` clean.
 - Stash leaves the tree clean and "Stashes · 1" appears. Apply brings back the changes, including new files, and keeps the stash. Pop brings them back and removes it.
+- Commit with a partly staged file commits only the staged part; the rest stays under Unstaged. With nothing staged, Commit asks first, and the second press stages everything and commits.
 - After a commit, Push reads "Push ↑1". Pressing it pushes, and the button greys out.
 - Click a diff line, type, press Enter: the comment appears under the line and Submit review · 1 shows. Submit opens the send dialog with the quoted line, and sending clears the draft.
 - Switching the scope to Last commit lists the last commit's files under Committed.

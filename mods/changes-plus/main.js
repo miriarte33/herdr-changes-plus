@@ -104,6 +104,7 @@ export default class Changes extends View {
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
       this.message = this.input.value();
+      if (this.confirmStageAll) { this.confirmStageAll = false; cx.notify(); }
       if (hadMessage !== Boolean(this.message.trim())) cx.notify();
     });
     this.input.on("submit", (_e, cx) => this.commit(cx));
@@ -146,7 +147,7 @@ export default class Changes extends View {
     if (this.loading || this.busy) { if (queue) this.again = true; return; }
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
-      this.context = context; this.root = null; this.files = []; this.open = null; this.comments = []; this.composer = null;
+      this.context = context; this.root = null; this.files = []; this.open = null; this.openSection = null; this.confirmStageAll = false; this.comments = []; this.composer = null;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note_ = null; this.watched = null; this.closed = false; this.limited = false;
       this.dirty = new Map(); this.pushable = null; this.stashes = [];
     }
@@ -205,6 +206,7 @@ export default class Changes extends View {
         const sectionStats = { staged: await numstat(git, ["--cached"]), unstaged: await numstat(git, []) };
         if (key() !== context) return;
         this.dirty = dirty; this.pushable = pushable; this.stashes = stashes; this.sectionStats = sectionStats;
+        if (this.hasStaged()) this.confirmStageAll = false;
         if (root !== this.root || scope !== this.scope || ref !== this.ref) { this.setLines([]); }
         const changedSet = root !== this.root || scope !== this.scope;
         this.root = root; this.on = on; this.hasHead = hasHead; this.scope = scope; this.scopeInfo = info; this.ref = ref;
@@ -213,8 +215,8 @@ export default class Changes extends View {
         this.files = files; this.limited = changed.size > 1000; this.error = null;
         this.watch(root, cx);
         if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
-        // The first file's diff shows until you pick another.
-        if (!this.open && !this.closed && files.length) this.open = files[0].path;
+        if (!this.open && !this.closed && files.length) this.open = this.sections()[0].rows[0].f.path;
+        if (this.open && !this.inSection(this.open, this.openSection)) this.openSection = this.sectionOf(this.open);
         if (this.open) {
           try { await this.load(this.open, context); }
           catch { if (key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
@@ -268,6 +270,19 @@ export default class Changes extends View {
       : this.scope === "last" ? `the last commit (${i.last}${i.subject ? `, "${i.subject}"` : ""}) plus the uncommitted changes`
       : "uncommitted changes";
   }
+  viewWords() {
+    const section = this.uncommittedSection(this.open);
+    return section === "staged" ? "staged changes: what a commit would include" : section === "unstaged" ? "unstaged changes: the working tree against the staged version" : this.scopeWords();
+  }
+  uncommittedSection(path) {
+    const xy = this.dirty.get(path);
+    if (this.scope !== "work" || !xy || xy === "??" || xy.includes("U") || xy === "AA" || xy === "DD") return null;
+    return this.openSection === "staged" || this.openSection === "unstaged" ? this.openSection : null;
+  }
+  diffBase(path) {
+    const section = this.uncommittedSection(path);
+    return section === "staged" ? ["--cached"] : section === "unstaged" || !this.hasHead ? [] : [this.ref ?? "HEAD"];
+  }
   setScope(scope, cx) {
     if (!this.root || scope === this.scope) { this.choosingScope = false; cx.notify(); return; }
     const all = { ...(shared(SCOPE) ?? {}) }; all[`${this.on ?? ""}:${this.root}`] = scope; setShared(SCOPE, all);
@@ -284,7 +299,7 @@ export default class Changes extends View {
     const file = this.files.find((f) => f.path === path), root = this.root, on = this.on;
     if (!file) return;
     let lines;
-    if (file.fresh || (!this.hasHead && file.status === "A")) {
+    if (file.fresh || (!this.hasHead && file.status === "A" && !this.uncommittedSection(path))) {
       const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
       if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
       else if (text.includes("\0")) lines = ["Binary file · no text diff"];
@@ -293,7 +308,7 @@ export default class Changes extends View {
         lines = [`@@ -0,0 +1,${file.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
       }
     } else {
-      const r = await exec("git", ["diff", ...(this.hasHead ? [this.ref ?? "HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
+      const r = await exec("git", ["diff", ...this.diffBase(path), "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
       if (r.code !== 0) throw new Error(r.stderr);
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
@@ -393,7 +408,7 @@ export default class Changes extends View {
   // Comment on a file as a whole (an image, a deleted file, anything without lines to click).
   commentFile(path, cx) {
     if (this.composer?.whole && this.composer.path === path && !this.composer.editing && !this.noteText.trim()) { this.closeComposer(cx); return; }
-    if (this.open !== path) this.pick(path, cx);
+    if (this.open !== path) this.pick(path, this.sectionOf(path), cx);
     this.composer = { path, whole: true, editing: null };
     this.openBox(cx, 0);
   }
@@ -460,7 +475,7 @@ export default class Changes extends View {
     if (!this.open || !this.rows.length) return;
     const rows = (indexes ? indexes.sort((a, b) => a - b).map((i) => this.rows[i]) : this.rows).filter(Boolean).slice(0, 400);
     const span = this.span(rows), title = `${this.open}${span ? `:${span.replace(/^(removed )?lines? /, "")}` : ""}`;
-    const head = indexes ? `In ${this.where(this.open)}, ${span || "these lines"} of the diff (${this.scopeWords()}; new-file line numbers; - lines are removed):` : `The diff of ${this.where(this.open)} (${this.scopeWords()}):`;
+    const head = indexes ? `In ${this.where(this.open)}, ${span || "these lines"} of the diff (${this.viewWords()}; new-file line numbers; - lines are removed):` : `The diff of ${this.where(this.open)} (${this.viewWords()}):`;
     cx.spawn(async (cx) => { try { await ask({ title, context: `${head}\n${this.quote(rows)}` }); } catch (e) { this.note_ = `Ask failed: ${e}`; } cx.notify(); });
   }
 
@@ -490,11 +505,17 @@ export default class Changes extends View {
     });
   }
 
+  hasStaged() { return [...this.dirty.values()].some((xy) => stagedState(xy)); }
+
   commit(cx) {
     const message = this.message.trim();
-    if (!message) return;
+    if (!message || !this.root || this.busy) return;
+    const stageAll = !this.hasStaged();
+    if (stageAll && !this.dirty.size) { this.note_ = "Nothing to commit"; cx.notify(); return; }
+    if (stageAll && !this.confirmStageAll) { this.confirmStageAll = true; cx.notify(); return; }
+    this.confirmStageAll = false;
     this.perform("commit", async ({ root, on }, context) => {
-      for (const args of [["add", "-A"], ["commit", "-m", message]]) {
+      for (const args of [...(stageAll ? [["add", "-A"]] : []), ["commit", "-m", message]]) {
         const r = await exec("git", args, { cwd: root, on });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
       }
@@ -681,9 +702,10 @@ export default class Changes extends View {
       // Narrow panel: the comment box is a strip under the diff instead of a column beside it.
       .when(Boolean(this.composer) && this.narrow(), (e) => e.child(this.box(t, target, true)))
       .when(Boolean(this.note_), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note_)))
+      .when(Boolean(this.confirmStageAll), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.blocked).child("Nothing is staged. Commit again to stage every change and commit it.")))
       .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
-        .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy === "commit" ? ACTIONS.commit.busy : "Commit"))
+        .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy === "commit" ? ACTIONS.commit.busy : this.confirmStageAll ? "Stage all & commit" : "Commit"))
         .child(this.pushButton(t)));
   }
 
@@ -728,7 +750,7 @@ export default class Changes extends View {
 
   fileRow(t, section, { f, letter, add, del }, k) {
     const parts = f.path.split("/"), name = parts.pop(), id = `${section}-${f.path}`;
-    return h_flex().id(`change-${id}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
+    return h_flex().id(`change-${id}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path && this.openSection === section, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, section, cx))
       .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.fileMenu(f.path); })
       .child(div().w(14).text_size(11).text_color(letter === "A" ? t.ansi2 : letter === "D" || letter === "U" ? t.ansi1 : t.blocked).child(letter))
       .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
@@ -784,8 +806,12 @@ export default class Changes extends View {
   }
 
 
-  pick(path, cx) {
-    this.open = this.open === path ? null : path; this.setLines([]); this.note_ = null;
+  sectionOf(path) { return this.sections().find((g) => g.rows.some((r) => r.f.path === path))?.key ?? null; }
+  inSection(path, section) { return this.sections().some((g) => g.key === section && g.rows.some((r) => r.f.path === path)); }
+
+  pick(path, section, cx) {
+    const same = this.open === path && this.openSection === section;
+    this.open = same ? null : path; this.openSection = same ? null : section; this.setLines([]); this.note_ = null;
     this.closed = !this.open;
     const context = this.context;
     if (this.open) cx.spawn(async (cx) => {
