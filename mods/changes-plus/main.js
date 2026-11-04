@@ -107,7 +107,7 @@ export default class Changes extends View {
       if (this.confirmStageAll) { this.confirmStageAll = false; cx.notify(); }
       if (hadMessage !== Boolean(this.message.trim())) cx.notify();
     });
-    this.input.on("submit", (_e, cx) => this.commit(cx));
+    this.input.on("submit", (e, cx) => e?.secondary ? this.push(cx) : this.commit(cx));
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.note = TextareaState.new({ placeholder: "Leave a comment on these lines…", rows: 4 });
@@ -676,6 +676,7 @@ export default class Changes extends View {
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
         else if (e.key === "escape" && this.composer) { this.closeComposer(cx); cx.stop_propagation(); }
         else if (e.key === "enter" && (e.modifiers?.platform || e.modifiers?.control) && this.composer) { this.addComment(cx); cx.stop_propagation(); }
+        else if (e.key === "enter" && e.modifiers?.platform && !this.typing) { this.push(cx); cx.stop_propagation(); }
       })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("Changes"))

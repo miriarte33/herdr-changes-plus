@@ -130,6 +130,7 @@ In the Last commit and vs base scopes every row diffs against the scope's ref. W
 - With nothing staged, the first Commit does not run git. The button turns into "Stage all & commit" and a `blocked` note reads "Nothing is staged. Commit again to stage every change and commit it." Pressing it again runs `git add -A` and then `git commit`. Editing the message, or staging something, cancels the question.
 - With no changes at all, Commit shows "Nothing to commit".
 - **Push** runs `git push` when the branch has an upstream and is ahead of it. With no upstream it runs `git push -u <remote> HEAD`, using `origin` or the first remote. It is disabled when up to date, on a detached HEAD, or with no remote, and its tooltip says why.
+- Cmd-Enter pushes from the commit input or elsewhere in the panel. When the comment composer is open, its existing Cmd/Ctrl-Enter shortcut still adds the comment.
 
 **Review.**
 - **Making a comment:**
